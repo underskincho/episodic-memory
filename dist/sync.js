@@ -1,3 +1,4 @@
+import { isOpencodeV2Transcript } from './parser.js';
 import fs from 'fs';
 import path from 'path';
 import { StringDecoder } from 'string_decoder';
@@ -132,7 +133,7 @@ function copyIfNewer(src, dest) {
     if (fs.existsSync(dest)) {
         const srcStat = fs.statSync(src);
         const destStat = fs.statSync(dest);
-        if (destStat.mtimeMs >= srcStat.mtimeMs) {
+        if (destStat.mtimeMs >= srcStat.mtimeMs && !(isOpencodeV2Transcript(src) && (srcStat.size !== destStat.size || !isOpencodeV2Transcript(dest)))) {
             return false; // Dest is current, skip
         }
     }
@@ -254,7 +255,7 @@ export async function syncConversations(sourceDir, destDir, options = {}) {
                 'indexing this run (copying and summaries still run). See the error above.');
         }
         if (embeddings) {
-            const { initDatabase, insertExchange } = await import('./db.js');
+            const { initDatabase, insertExchange, deleteExchange } = await import('./db.js');
             const { generateExchangeEmbedding } = embeddings;
             const db = initDatabase();
             const maxMessageBytes = getMaxMessageBytes();
@@ -273,9 +274,11 @@ export async function syncConversations(sourceDir, destDir, options = {}) {
                     const maxIndexedLine = hw.maxLine;
                     const project = path.basename(path.dirname(file));
                     const exchanges = await parseConversation(file, project, file);
-                    const newExchanges = maxIndexedLine > 0
+                    const snapshot = isOpencodeV2Transcript(file);
+                    const newExchanges = !snapshot && maxIndexedLine > 0
                         ? exchanges.filter(e => e.lineStart > maxIndexedLine)
                         : exchanges;
+                    const prepared = [];
                     for (const exchange of newExchanges) {
                         // Skip oversize single messages BEFORE embedding — a foreign
                         // summarizer's pasted transcript is noise, and embedding it is the
@@ -286,7 +289,21 @@ export async function syncConversations(sourceDir, destDir, options = {}) {
                         }
                         const toolNames = exchange.toolCalls?.map(tc => tc.toolName);
                         const embedding = await generateExchangeEmbedding(exchange.userMessage, exchange.assistantMessage, toolNames);
-                        insertExchange(db, exchange, embedding, toolNames);
+                        if (snapshot)
+                            prepared.push({ exchange, embedding, toolNames });
+                        else
+                            insertExchange(db, exchange, embedding, toolNames);
+                    }
+                    if (snapshot) {
+                        // Rebuild atomically: streaming edits can replace the last answer or
+                        // shift exchange line IDs. Keep the prior index if embedding fails.
+                        db.transaction(() => {
+                            const prior = db.prepare('SELECT id FROM exchanges WHERE archive_path = ?').all(file);
+                            for (const row of prior)
+                                deleteExchange(db, row.id);
+                            for (const row of prepared)
+                                insertExchange(db, row.exchange, row.embedding, row.toolNames);
+                        })();
                     }
                     result.indexed++;
                 }

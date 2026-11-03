@@ -1,0 +1,21 @@
+{
+  "exported": {
+    "exported": 41,
+    "skipped": 62,
+    "errors": [],
+    "dbPath": "C:\\Users\\CHo\\.local\\share\\opencode\\opencode.db",
+    "transcriptDir": "C:\\Users\\CHo\\.config\\superpowers\\opencode-transcripts"
+  },
+  "sync": {
+    "copied": 41,
+    "skipped": 62,
+    "indexed": 40,
+    "summarized": 0,
+    "errors": []
+  },
+  "session": "ses_e5dd79bf7ffeyEcNxtr9p3b1ad",
+  "archived": true,
+  "parsedExchanges": 1,
+  "searchHits": 1,
+  "sidechain": true
+}

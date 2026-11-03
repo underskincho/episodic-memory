@@ -4,6 +4,18 @@ import path from 'path';
 import { ConversationExchange, ConversationHarness, ToolCall } from './types.js';
 import crypto from 'crypto';
 
+/** V2 database exports are replaceable snapshots, not append-only transcripts. */
+export function isOpencodeV2Transcript(filePath: string): boolean {
+  const fd = fs.openSync(filePath, 'r');
+  try {
+    const prefix = Buffer.alloc(80);
+    const length = fs.readSync(fd, prefix, 0, prefix.length, 0);
+    return prefix.toString('utf8', 0, length).startsWith('{"type":"opencode_session","storageVersion":2,');
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
 interface JSONLMessage {
   type: string;
   message?: {
@@ -490,6 +502,7 @@ async function parseOpencodeConversation(
   let cwd: string | undefined;
   let agentVersion: string | undefined;
   let agent: string | undefined;
+  let isSidechain = false;
   let model: string | undefined;
   let modelProvider: string | undefined;
   let currentExchange: ExchangeBuilder | null = null;
@@ -531,6 +544,7 @@ async function parseOpencodeConversation(
         lineStart: currentExchange.userLine,
         lineEnd: currentExchange.lastAssistantLine,
         harness: 'opencode',
+        isSidechain,
         sessionId: currentExchange.sessionId,
         cwd: currentExchange.cwd,
         agentVersion: currentExchange.agentVersion,
@@ -572,6 +586,7 @@ async function parseOpencodeConversation(
 
       if (parsed.type === 'opencode_session' && parsed.session) {
         sessionId = parsed.session.id || sessionId;
+        isSidechain = Boolean(parsed.session.parentID);
         cwd = parsed.session.directory || parsed.project?.worktree || cwd;
         agentVersion = parsed.session.version || agentVersion;
         agent = parsed.session.agent || agent;

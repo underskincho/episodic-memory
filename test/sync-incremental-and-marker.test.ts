@@ -108,6 +108,31 @@ describe('sync: high-water mark (#152 Part A)', () => {
     } catch {}
   });
 
+  it('replaces a V2 snapshot index when streaming edits change an existing exchange', async () => {
+    mkdirSync(join(sourceDir, 'v2'), { recursive: true });
+    const srcFile = join(sourceDir, 'v2', 'opencode-ses_v2.jsonl');
+    const snapshot = (answer: string, extra = false) => [
+      { type: 'opencode_session', storageVersion: 2, session: { id: 'ses_v2', directory: '/work/v2' } },
+      { type: 'opencode_message', message: { role: 'user' }, parts: [{ type: 'text', text: 'V2 question' }] },
+      { type: 'opencode_message', message: { role: 'assistant' }, parts: [{ type: 'text', text: answer }] },
+      ...(extra ? [{ type: 'opencode_message', message: { role: 'assistant' }, parts: [{ type: 'text', text: 'continued' }] }] : []),
+    ].map(x => JSON.stringify(x)).join('\n') + '\n';
+    writeFileSync(srcFile, snapshot('partial'));
+    expect((await syncConversations(sourceDir, destDir, { skipSummaries: true })).errors).toEqual([]);
+    writeFileSync(srcFile, snapshot('finished', true));
+    const future = new Date(Date.now() + 5000);
+    utimesSync(srcFile, future, future);
+    expect((await syncConversations(sourceDir, destDir, { skipSummaries: true })).errors).toEqual([]);
+    const check = new Database(dbPath);
+    sqliteVec.load(check);
+    expect(check.prepare('SELECT assistant_message FROM exchanges').all()).toEqual([{ assistant_message: 'finished\n\ncontinued' }]);
+    expect(check.prepare('SELECT COUNT(*) AS n FROM vec_exchanges').get()).toEqual({ n: 1 });
+    check.close();
+    const calls = embedSpy.mock.calls.length;
+    expect((await syncConversations(sourceDir, destDir, { skipSummaries: true })).copied).toBe(0);
+    expect(embedSpy.mock.calls.length).toBe(calls);
+  });
+
   it('only re-embeds newly appended exchanges on a subsequent sync, not the whole file', async () => {
     const sessionId = '019aff97-5651-71e0-80ec-b4f2c51095c3';
     mkdirSync(join(sourceDir, 'project-a'), { recursive: true });

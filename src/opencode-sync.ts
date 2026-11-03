@@ -14,6 +14,7 @@ export interface OpencodeExportResult {
 interface OpencodeSessionRow {
   id: string;
   project_id: string;
+  parent_id?: string | null;
   slug: string;
   directory: string;
   title: string;
@@ -83,31 +84,52 @@ export function getOpencodeTranscriptFilePath(
   return path.join(transcriptDir, project, `opencode-${safeSegment(input.sessionId)}.jsonl`);
 }
 
-function shouldExportSession(filePath: string, sessionUpdatedMs: number): boolean {
+function shouldExportSession(filePath: string, sessionUpdatedMs: number, v2 = false): boolean {
   if (!fs.existsSync(filePath)) return true;
+  if (v2) {
+    // Refresh legacy exports of sessions migrated with the same ID/timestamp once.
+    const fd = fs.openSync(filePath, 'r');
+    try {
+      const prefix = Buffer.alloc(80);
+      const length = fs.readSync(fd, prefix, 0, prefix.length, 0);
+      if (!prefix.toString('utf8', 0, length).startsWith('{"type":"opencode_session","storageVersion":2,"exportVersion":1,')) return true;
+    } finally {
+      fs.closeSync(fd);
+    }
+  }
   const stat = fs.statSync(filePath);
   return Math.floor(stat.mtimeMs) < Math.floor(sessionUpdatedMs);
+}
+
+function normalizeV2Part(part: Record<string, unknown>): Record<string, unknown> {
+  if (part.type !== 'tool') return part;
+  const state = part.state as Record<string, unknown> | undefined;
+  return {
+    ...part, tool: part.name, callID: part.id,
+    state: { ...state, output: state?.content ?? state?.error },
+  };
 }
 
 function writeSessionTranscript(
   db: Database.Database,
   session: OpencodeSessionRow,
-  filePath: string
+  filePath: string,
+  v2 = false
 ): void {
   const messages = db.prepare(`
-    SELECT id, session_id, time_created, time_updated, data
-    FROM message
+    SELECT id, session_id, time_created, time_updated, data${v2 ? ", type" : ""}
+    FROM ${v2 ? "session_message" : "message"}
     WHERE session_id = ?
-    ORDER BY time_created, id
-  `).all(session.id) as OpencodeMessageRow[];
+    ORDER BY ${v2 ? "seq" : "time_created, id"}
+  `).all(session.id) as (OpencodeMessageRow & { type?: string })[];
 
   const partsByMessage = new Map<string, OpencodePartRow[]>();
   if (messages.length > 0) {
     const parts = db.prepare(`
-      SELECT id, message_id, session_id, time_created, time_updated, data
-      FROM part
+      SELECT ${v2 ? "message_id || '_' || ordinal AS id, type" : "id"}, message_id, session_id, time_created, time_updated, data
+      FROM ${v2 ? "session_part" : "part"}
       WHERE session_id = ?
-      ORDER BY time_created, id
+      ORDER BY ${v2 ? "message_id, ordinal" : "time_created, id"}
     `).all(session.id) as OpencodePartRow[];
     for (const part of parts) {
       const list = partsByMessage.get(part.message_id) || [];
@@ -119,6 +141,7 @@ function writeSessionTranscript(
   const lines: string[] = [];
   lines.push(JSON.stringify({
     type: 'opencode_session',
+    ...(v2 ? { storageVersion: 2, exportVersion: 1 } : {}),
     session: {
       id: session.id,
       projectID: session.project_id,
@@ -126,6 +149,7 @@ function writeSessionTranscript(
       directory: session.directory,
       title: session.title,
       version: session.version,
+      parentID: session.parent_id || undefined,
       agent: session.agent || undefined,
       model: safeParseJson(session.model),
       time: {
@@ -151,6 +175,7 @@ function writeSessionTranscript(
         : { raw: parsedPart };
       return {
         ...partData,
+        ...(v2 ? normalizeV2Part(partData) : {}),
         id: part.id,
         sessionID: part.session_id,
         messageID: part.message_id,
@@ -159,11 +184,25 @@ function writeSessionTranscript(
       };
     });
 
+    // Completed assistants can be folded into message.data.content; streaming
+    // assistants use ordinal session_part rows instead (V2 projector.ts).
+    if (v2 && parts.length === 0 && Array.isArray(messageData.content)) {
+      parts.push(...messageData.content.map(part => normalizeV2Part(part)) as any);
+    }
+    // V2 user/synthetic text is stored on the message, not in session_part.
+    if (v2 && ['user', 'synthetic'].includes(message.type || '') && typeof messageData.text === 'string') {
+      parts.unshift({ type: 'text', text: messageData.text } as any);
+    }
     lines.push(JSON.stringify({
       type: 'opencode_message',
       sessionID: message.session_id,
       message: {
         ...messageData,
+        ...(v2 ? {
+          type: message.type,
+          role: message.type === 'assistant' ? 'assistant'
+            : ['user', 'synthetic'].includes(message.type || '') ? 'user' : undefined,
+        } : {}),
         id: message.id,
         sessionID: message.session_id,
         timeCreated: message.time_created,
@@ -201,28 +240,27 @@ export function exportOpencodeSessions(options: {
 
   const db = new Database(dbPath, { readonly: true, fileMustExist: true });
   try {
-    if (!tableExists(db, 'session') || !tableExists(db, 'message') || !tableExists(db, 'part')) {
-      return result;
+    const hasV2 = ['session_v2', 'session_message', 'session_part'].every(t => tableExists(db, t));
+    const hasV1 = ['session', 'message', 'part'].every(t => tableExists(db, t));
+    const sessions: (OpencodeSessionRow & { v2: boolean })[] = [];
+    for (const v2 of [true, false]) {
+      if (v2 ? !hasV2 : !hasV1) continue;
+      const table = v2 ? 'session_v2' : 'session';
+      const messageTable = v2 ? 'session_message' : 'message';
+      const partTable = v2 ? 'session_part' : 'part';
+      // Message/part updates can outlive the session row's timestamp during streaming.
+      const rows = db.prepare(`
+        SELECT s.*, ${v2 ? 's.parent_id' : 'NULL'} AS parent_id,
+          MAX(s.time_updated,
+            COALESCE((SELECT MAX(time_updated) FROM ${messageTable} WHERE session_id=s.id), 0),
+            COALESCE((SELECT MAX(time_updated) FROM ${partTable} WHERE session_id=s.id), 0)) AS export_updated,
+          p.name AS project_name, p.worktree AS project_worktree
+        FROM ${table} s LEFT JOIN project p ON p.id=s.project_id
+        ${!v2 && hasV2 ? 'WHERE NOT EXISTS (SELECT 1 FROM session_v2 v WHERE v.id=s.id)' : ''}
+        ORDER BY s.time_updated, s.id
+      `).all() as OpencodeSessionRow[];
+      sessions.push(...rows.map(row => ({ ...row, time_updated: (row as OpencodeSessionRow & { export_updated: number }).export_updated, v2 })));
     }
-
-    const sessions = db.prepare(`
-      SELECT
-        s.id,
-        s.project_id,
-        s.slug,
-        s.directory,
-        s.title,
-        s.version,
-        s.time_created,
-        s.time_updated,
-        s.agent,
-        s.model,
-        p.name AS project_name,
-        p.worktree AS project_worktree
-      FROM session s
-      LEFT JOIN project p ON p.id = s.project_id
-      ORDER BY s.time_updated, s.id
-    `).all() as OpencodeSessionRow[];
 
     for (const session of sessions) {
       try {
@@ -230,11 +268,11 @@ export function exportOpencodeSessions(options: {
           sessionId: session.id,
           directory: session.directory,
         });
-        if (!shouldExportSession(filePath, session.time_updated)) {
+        if (!shouldExportSession(filePath, session.time_updated, session.v2)) {
           result.skipped++;
           continue;
         }
-        writeSessionTranscript(db, session, filePath);
+        writeSessionTranscript(db, session, filePath, session.v2);
         result.exported++;
       } catch (error) {
         result.errors.push({

@@ -1,0 +1,16 @@
+{
+  "exported": {
+    "exported": 0,
+    "skipped": 103,
+    "errors": [],
+    "dbPath": "C:\\Users\\CHo\\.local\\share\\opencode\\opencode.db",
+    "transcriptDir": "C:\\Users\\CHo\\.config\\superpowers\\opencode-transcripts"
+  },
+  "sync": {
+    "copied": 0,
+    "skipped": 103,
+    "indexed": 0,
+    "summarized": 0,
+    "errors": []
+  }
+}

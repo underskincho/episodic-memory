@@ -2,6 +2,18 @@ import fs from 'fs';
 import readline from 'readline';
 import path from 'path';
 import crypto from 'crypto';
+/** V2 database exports are replaceable snapshots, not append-only transcripts. */
+export function isOpencodeV2Transcript(filePath) {
+    const fd = fs.openSync(filePath, 'r');
+    try {
+        const prefix = Buffer.alloc(80);
+        const length = fs.readSync(fd, prefix, 0, prefix.length, 0);
+        return prefix.toString('utf8', 0, length).startsWith('{"type":"opencode_session","storageVersion":2,');
+    }
+    finally {
+        fs.closeSync(fd);
+    }
+}
 async function detectConversationHarness(filePath) {
     const fileStream = fs.createReadStream(filePath);
     const rl = readline.createInterface({
@@ -353,6 +365,7 @@ async function parseOpencodeConversation(filePath, projectName, archivePath) {
     let cwd;
     let agentVersion;
     let agent;
+    let isSidechain = false;
     let model;
     let modelProvider;
     let currentExchange = null;
@@ -389,6 +402,7 @@ async function parseOpencodeConversation(filePath, projectName, archivePath) {
                 lineStart: currentExchange.userLine,
                 lineEnd: currentExchange.lastAssistantLine,
                 harness: 'opencode',
+                isSidechain,
                 sessionId: currentExchange.sessionId,
                 cwd: currentExchange.cwd,
                 agentVersion: currentExchange.agentVersion,
@@ -426,6 +440,7 @@ async function parseOpencodeConversation(filePath, projectName, archivePath) {
             const parsed = JSON.parse(line);
             if (parsed.type === 'opencode_session' && parsed.session) {
                 sessionId = parsed.session.id || sessionId;
+                isSidechain = Boolean(parsed.session.parentID);
                 cwd = parsed.session.directory || parsed.project?.worktree || cwd;
                 agentVersion = parsed.session.version || agentVersion;
                 agent = parsed.session.agent || agent;

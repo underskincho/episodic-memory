@@ -1,4 +1,6 @@
 import { ConversationExchange } from './types.js';
+/** V2 database exports are replaceable snapshots, not append-only transcripts. */
+export declare function isOpencodeV2Transcript(filePath: string): boolean;
 export declare function parseConversation(filePath: string, projectName: string, archivePath: string): Promise<ConversationExchange[]>;
 /**
  * Cursor transcripts carry no workspace field; recover the working directory
